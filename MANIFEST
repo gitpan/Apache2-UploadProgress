@@ -1,0 +1,22 @@
+Build.PL
+Changes
+examples/css/upload.css
+examples/js/Jemplate.js
+examples/js/meter.tmpl
+examples/js/meter.tmpl.js
+examples/js/prototype.js
+examples/js/upload.js
+examples/upload.cgi
+lib/Apache2/UploadProgress.pm
+MANIFEST			This list of files
+t/01use.t
+t/02pod.t
+t/03podcoverage.t
+t/apache/upload.t
+t/conf/extra.conf.in
+t/response/TestApache/Upload.pm
+t/TEST
+TODO
+META.yml
+Makefile.PL
+README
