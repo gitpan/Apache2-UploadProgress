@@ -4,11 +4,13 @@ use strict;
 use warnings;
 use bytes;
 
-use Apache2::Const       -compile => qw( OK DECLINED NOT_FOUND M_POST );
+use Apache2::Const       -compile => qw( OK DECLINED NOT_FOUND M_POST RSRC_CONF TAKE1 );
 use Apache2::Filter      qw[];
+use Apache2::Module      qw[];
 use Apache2::RequestRec  qw[];
 use Apache2::RequestIO   qw[];
 use Apache2::Response    qw[];
+use Apache2::ServerUtil  qw[];
 use APR::Const           -compile => qw( SUCCESS );
 use APR::Brigade         qw[];
 use APR::Bucket          qw[];
@@ -16,8 +18,9 @@ use APR::Table           qw[];
 use Cache::FastMmap      qw[];
 use File::Spec           qw[];
 use HTTP::Headers::Util  qw[split_header_words];
+use Time::HiRes          qw[sleep];
 
-our $VERSION = 0.1;
+our $VERSION = 0.2;
 
 our $CACHE = Cache::FastMmap->new(
     share_file => $ENV{UPLOADPROGRESS_SHARE_FILE} || File::Spec->catfile( File::Spec->tmpdir, 'Apache2-UploadProgress' ),
@@ -27,7 +30,44 @@ our $CACHE = Cache::FastMmap->new(
     num_pages  => $ENV{UPLOADPROGRESS_NUM_PAGES} || '89',
 ) or die qq/Failed to create a new instance of Cache::FastMmap. Reason: '$!'/;
 
-our ( $TEMPLATES, $MIMES );
+our $DIRECTIVES = [
+    {
+        name         => 'UploadProgressBaseURI',
+        req_override => Apache2::Const::RSRC_CONF,
+        args_how     => Apache2::Const::TAKE1,
+        errmsg       => 'Absolute or relative URI to extras without trailing forward slash',
+    }
+];
+
+our ( $TEMPLATES, $MIMES, $HAS_BASEURI );
+
+if ( $ENV{MOD_PERL} ) {
+
+    Apache2::Module::add( __PACKAGE__, $DIRECTIVES );
+
+    if (    Apache2::ServerUtil::restart_count() > 1
+         && Apache2::Module::loaded('mod_alias.c')
+         && Apache2::Module::loaded('mod_mime.c') ) {
+
+        my $config = [
+            sprintf( 'Alias /UploadProgress %s/extra', substr( __FILE__, 0, -3 ) ),
+            '<Location /UploadProgress>',
+            'SetHandler default-handler',
+            Apache2::Module::loaded('mod_expires.c')
+              ? ( 'ExpiresActive On', 'ExpiresDefault "access plus 1 day"')
+              : (),
+            '</Location>',
+            '<Location /UpdateProgress>',
+            'SetHandler modperl',
+            'PerlResponseHandler Apache2::UploadProgress->progress',
+            '</Location>'
+        ];
+
+        Apache2::ServerUtil->server->add_config($config);
+
+        $HAS_BASEURI = 1;
+    }
+}
 
 $TEMPLATES->{html} = <<'EOF';
 <!DOCTYPE html
@@ -35,13 +75,14 @@ $TEMPLATES->{html} = <<'EOF';
     "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
 <head>
-    <title>UploadProgress</title>
+  <title>UploadProgress</title>
+  <link rel="stylesheet" type="text/css" href="/UploadProgress/progress.css" />
+  <script src="/UploadProgress/progress.js" type="text/javascript"></script>
+  <script src="/UploadProgress/progress.jmpl.js" type="text/javascript"></script>
 </head>
-<body>
-    <table>
-        <thead><tr><th>Size</th><th>Received</th></tr></thead>
-        <tbody><tr><td>%d</td><td>%d</td></tr></tbody>
-    </table>
+<body onLoad="updateHTMLProgressBar({ size : '%d', received : '%d' })">
+  <h3>Upload Progress</h3>
+  <div id="progress"></div>
 </body>
 </html>
 EOF
@@ -63,23 +104,65 @@ EOF
 
 $TEMPLATES->{xml} = <<'EOF';
 <?xml version="1.0" encoding="UTF-8"?>
-<upload>
+%s<upload%s>
     <size>%d</size>
     <received>%d</received>
 </upload>
 EOF
 
 $MIMES = {
-    'application/x-json'    => \$TEMPLATES->{json},
-    'application/x-yaml'    => \$TEMPLATES->{yaml},
-    'application/xhtml+xml' => \$TEMPLATES->{html},
-    'application/xml'       => \$TEMPLATES->{xml},
-    'text/html'             => \$TEMPLATES->{html},
-    'text/plain'            => \$TEMPLATES->{text},
-    'text/x-json'           => \$TEMPLATES->{json},
-    'text/x-yaml'           => \$TEMPLATES->{yaml},
-    'text/xml'              => \$TEMPLATES->{xml}
+    'application/x-json'    => sub { sprintf( $TEMPLATES->{json}, @_ ) },
+    'application/x-yaml'    => sub { sprintf( $TEMPLATES->{yaml}, @_ ) },
+    'application/xhtml+xml' => sub { sprintf( $TEMPLATES->{html}, @_ ) },
+    'application/xml'       => \&xml_template,
+    'text/html'             => sub { sprintf( $TEMPLATES->{html}, @_ ) },
+    'text/plain'            => sub { sprintf( $TEMPLATES->{text}, @_ ) },
+    'text/x-json'           => sub { sprintf( $TEMPLATES->{json}, @_ ) },
+    'text/x-yaml'           => sub { sprintf( $TEMPLATES->{yaml}, @_ ) },
+    'text/xml'              => \&xml_template,
 };
+
+sub xml_template {
+    my ($size, $received, $r) = @_;
+    my $xsl = '';
+    my $xsd = '';
+    if ( my $uri = Apache2::UploadProgress->base_uri($r) ) {
+        $xsl = "<?xml-stylesheet type=\"text/xsl\" href=\"${uri}/progress.xsl\"?>\n";
+        $xsd = ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="${uri}/progress.xsd"';
+    }
+    return sprintf( $TEMPLATES->{xml}, $xsl, $xsd, $size, $received);
+}
+
+
+sub register_mime : method {
+    my ( $class, $mime, $callback ) = @_;
+    $MIMES->{ lc $mime } = $callback;
+}
+
+sub UploadProgressBaseURI {
+    my ( $self, $parms, $uri ) = @_;
+    $self->{UploadProgressBaseURI} = $uri;    
+}
+
+sub config {
+    my ( $class, $r ) = @_;
+    return Apache2::Module::get_config( __PACKAGE__, $r->server, $r->per_dir_config );
+}
+
+sub base_uri {
+    my ( $class, $r ) = @_;
+
+    if ( $r ) {
+        my $config = $class->config($r);
+        return $config->{UploadProgressBaseURI} if $config->{UploadProgressBaseURI};
+    }
+
+    if ( $HAS_BASEURI ) {
+        return '/UploadProgress';
+    }
+
+    return undef;
+}
 
 sub progress_id {
     my ( $class, $r ) = @_;
@@ -119,6 +202,8 @@ sub track_progress {
         $ctx->[1]->[1] = 0;
 
         $f->ctx($ctx);
+
+        $class->store_progress( @{ $f->ctx } );
     }
 
     my $rv = $f->next->get_brigade( $bb, $mode, $block, $readbytes );
@@ -153,9 +238,21 @@ sub progress : method {
 
     my $progress_id = $class->progress_id($r)
       or return Apache2::Const::NOT_FOUND;
+      
+    my $progress = undef;
+    my $tries    = 16; # wait a max of 4 seconds for the upload to start
+    
+    while ( $tries && !$progress ) {
 
-    my $progress = $class->fetch_progress($progress_id)
-      or return Apache2::Const::NOT_FOUND;
+        $progress = $class->fetch_progress($progress_id)
+          or sleep(0.250);
+        
+        $tries--;
+    }
+    
+    unless ( $progress ) {
+        return Apache2::Const::NOT_FOUND;
+    }
 
     my $content_type = 'text/xml';
 
@@ -189,8 +286,8 @@ sub progress : method {
     $r->headers_out->set( 'Expires'       => 'Thu, 01 Jan 1970 00:00:00 GMT' );
     $r->headers_out->set( 'Cache-Control' => 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0' );
 
-    my $template = $MIMES->{$content_type};
-    my $content  = sprintf $$template, @$progress;
+    my $callback = $MIMES->{$content_type};
+    my $content  = $callback->( @$progress, $r );
 
     $r->content_type($content_type);
     $r->set_content_length( length $content );
@@ -205,17 +302,28 @@ __END__
 
 =head1 NAME
 
-Apache2::UploadProgress - Track Upload Progress
+Apache2::UploadProgress - Track the progress and give realtime feedback of file uploads
 
 =head1 SYNOPSIS
+
+In Apache:
 
     PerlLoadModule             Apache2::UploadProgress
     PerlPostReadRequestHandler Apache2::UploadProgress
 
-    <Location /progress>
-        SetHandler modperl
-        PerlResponseHandler Apache2::UploadProgress->progress
-    </Location>
+In your HTML form:
+
+ <script src="/UploadProgress/progress.js"></script>
+ <link type="text/css" href="/UploadProgress/progress.css"/>
+ <form action="/cgi-bin/script.cgi"
+       method="post"
+       enctype="multipart/form-data"
+       onsubmit="return startEmbeddedProgressBar(this)">
+ <input type="file" name="file"/>
+ <input type="submit" name=".submit"/>
+ </form>
+ <div id="progress"></div>
+
 
 =head1 DESCRIPTION
 
@@ -223,18 +331,86 @@ This module allows you to track the progress of a file upload in order
 to provide a user with realtime updates on the progress of their file
 upload.
 
-The information that is provided by this module is very basic.  It just includes
-the total size of the upload, and the current number of bytes that have been received.
-However, this information is sufficient to display lots of information about the
-upload to the user.  Generally this is achieved using some JavaScript and AJAX
-calls in the browser, however, it could also be accomplished using a popup
-window with a meta refresh that continuously reloads the progress URL.
+The information that is provided by this module is very basic.  It just
+includes the total size of the upload, and the current number of bytes that
+have been received.  However, this information is sufficient to display lots of
+information about the upload to the user.  At it's simplest, you can trigger a
+popup window that will automatically refresh until the upload completes.
+However, popups can be a problem sometimes, so it is also possible to embed a
+progress monitor directly into the page using some JavaScript and AJAX calls.
+Examples using both techniques are discussed below in the EXAMPLES section.
 
-=head1 EXAMPLE
 
-Please see the examples directory for a complete example that includes a dynamic
-progress bar, and extended status information like transfer rates, and ETA.
+=head1 EXAMPLES
 
+=head2 Simple Popup Upload Monitor
+
+The simplest way to add a progress monitor to your forms is to use the popup
+technique.  This will launch a popup window with a progress monitor that will
+automatically refresh until the upload is complete.  The popup will use the XML
+method by default, and format the page using an included XSL stylesheet (which
+can be customized to suit your needs).  If the browser does not support XML
+transformations, then content negotiation will automatically fall back on a
+basic HTML page.
+
+Here is what you need to do to get the popup technique working:
+
+ <script src="/UploadProgress/progress.js"></script>
+ <form action="/cgi-bin/script.cgi"
+       method="post"
+       enctype="multipart/form-data"
+       onsubmit="return startPopupProgressBar(this, {width : 500, height : 400})">
+ <input type="file" name="file"/>
+ <input type="submit" name=".submit"/>
+ </form>
+
+So all we have done is add an onsubmit handler on the form that will pop up a
+new window and load the progress monitor.  No changes need to be made to your
+CGI script, and nothing else needs to be done (apart from the standard Apache
+configuration directives listed in the SYNOPSIS above)
+
+=head2 Embedded Upload Monitor
+
+It is also possible to embed the progress monitor directly into the page and it
+is just as easy:
+
+ <script src="/UploadProgress/progress.js"></script>
+ <link type="text/css" href="/UploadProgress/progress.css"/>
+ <form action="/cgi-bin/script.cgi"
+       method="post"
+       enctype="multipart/form-data"
+       onsubmit="return startEmbeddedProgressBar(this)">
+ <input type="file" name="file"/>
+ <input type="submit" name=".submit"/>
+ </form>
+ <div id="progress"></div>
+
+The only difference is that we changed the onsubmit handler to call
+startEmbeddedProgressBar, and then we added and extra 'div' tag to indicate
+where we want the progress monitor to appear.
+
+
+For complete runable examples please see the scripts in the examples directory.
+
+=head1 APACHE CONFIGURATION
+
+=over 4
+
+=item UploadProgressBaseURI
+
+Change the location of the extra support files, so that you can customize them
+to suit your needs.
+
+ UploadProgressBaseURI /CustomUploadProgess
+ Alias /CustomUploadProgess /var/www/customprogressfiles
+
+Make sure that you copy all the support files found in the 'extra' directory to
+this new location and then you can customize them to your liking.
+
+This currently only affects the urls used in the XML/XSL and HTML mime handlers
+used in the popup progress monitor.
+
+=back
 
 =head1 HANDLERS
 
@@ -324,6 +500,27 @@ script that is included in the examples directory.
 
 =back
 
+=head1 PUBLIC METHODS
+
+=over 4
+
+=item register_mime( $mime, \&callback )
+
+    my $callback = sub { 
+        my ( $size, $received, $r ) = @_;
+        return sprintf "Total size: %d\n Received: %d\n", $size, $received;
+    };
+
+    Apache2::UploadProgress->register_mime( 'text/plain' => $callback );
+
+Register a content handler for a mime. Callback will be called with three 
+positional arguments, size, received and C<$r>. Callback is expected to return a 
+scalar of octets representing the response body.  This can be used to override
+any of the existing content handlers (for example if you wanted a custom HTML
+response, override 'text/html').
+
+=back
+
 =head1 INTERNAL METHODS
 
 The following internal methods should never need to be called directly but
@@ -356,6 +553,22 @@ Update the progress values in the cache for the given ID
 An Input filter handler that totals up the number of bytes that have been sent
 as part of the current request, and updates the current progress through calls
 to C<store_progress>.
+
+=back
+
+=head1 BUGS
+
+=over 4
+
+=item Safari
+
+The JavaScript for the embedded progress meter is currently failing in
+Safari
+
+=item Cancelled uploads
+
+When a user cancels an upload, but leaves the page with the progress
+meter active, the progress meter may continue to reload indefinately
 
 =back
 

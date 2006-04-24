@@ -14,20 +14,16 @@ print $q->header(
           -charset  => 'UTF-8',
       ),
       $q->start_html(
-          -title    => 'Apache2::UploadProgress Example',
+          -title    => 'Apache2::UploadProgress Popup Example',
           -encoding => 'UTF-8',
-          -script   => [ { -src => 'js/prototype.js'  },
-                         { -src => 'js/Jemplate.js'   },
-                         { -src => 'js/meter.tmpl.js' },
-                         { -src => 'js/upload.js'     } ],
-          -style    => { -src => 'css/upload.css' },
+          -script   => { -src => '/UploadProgress/progress.js' },
       ),
       $q->h1( $q->param('file') ? 'Upload complete!' : 'Apache2::UploadProgress Example' ),
       $q->start_form(
-          -action   => sprintf( "%s?progress_id=%s", $q->script_name, $id ),
+          -action   => $q->script_name,
           -enctype  => 'multipart/form-data',
           -method   => 'POST',
-          -onsubmit => 'return startUploadProgress(this);'
+          -onsubmit => 'return startPopupProgressBar(this, {width : 500, height : 400});'
       ),
       $q->table(
           $q->Tr( [
@@ -35,7 +31,7 @@ print $q->header(
               $q->td( [ 'File', $q->filefield( -name => 'file' ) ] )
           ] )
       ),
-      $q->div( { -id => 'progress' }, $q->submit ),
+      $q->submit,
       $q->end_form,
       $q->h2('Parameters'),
       $q->Dump,

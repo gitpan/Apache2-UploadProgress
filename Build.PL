@@ -16,11 +16,20 @@ my $build = $build_pkg->new(
         'perl'                => 5.006,
         'mod_perl2'           => 2.00,
         'Cache::FastMmap'     => 0,
-        'HTTP::Headers::Util' => 0
+        'HTTP::Headers::Util' => 0,
+        'Time::HiRes'         => 0
     },
     build_requires => {
         'Apache::Test' => 1.12,
         'CGI'          => 3.08
+    },
+    pod_files => {
+        'extra/progress.css'     => 'lib/Apache2/UploadProgress/extra/progress.css',
+        'extra/progress.js'      => 'lib/Apache2/UploadProgress/extra/progress.js',
+        'extra/progress.jmpl'    => 'lib/Apache2/UploadProgress/extra/progress.jmpl',
+        'extra/progress.jmpl.js' => 'lib/Apache2/UploadProgress/extra/progress.jmpl.js',
+        'extra/progress.xsd'     => 'lib/Apache2/UploadProgress/extra/progress.xsd',
+        'extra/progress.xsl'     => 'lib/Apache2/UploadProgress/extra/progress.xsl',
     },
 );
 $build->create_build_script;

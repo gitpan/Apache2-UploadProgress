@@ -1,6 +1,6 @@
 ---
 name: Apache2-UploadProgress
-version: 0.1
+version: 0.2
 author:
   - 'Christian Hansen <chansen@cpan.org>'
 abstract: Track the progress and give realtime feedback of file uploads
@@ -8,6 +8,7 @@ license: perl
 requires:
   Cache::FastMmap: 0
   HTTP::Headers::Util: 0
+  Time::HiRes: 0
   mod_perl2: 2
   perl: 5.006
 build_requires:
@@ -16,5 +17,5 @@ build_requires:
 provides:
   Apache2::UploadProgress:
     file: lib/Apache2/UploadProgress.pm
-    version: 0.1
+    version: 0.2
 generated_by: Module::Build version 0.2612
